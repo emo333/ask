@@ -1,0 +1,698 @@
+#!/bin/bash
+
+# This script is a single-file bash CLI that sends a prompt to Opencode Zen's API
+# and prints the response in the terminal. It is meant to be run directly as either ./ask or,
+# if you place it somewhere else like ~/.local/bin/ and that has been added to your PATH, as ask.
+
+# ########################################
+# ########################################
+# Path to the Opencode authentication file. The Zen API key lives here after
+# running `opencode auth login --provider zen`. Guard it like your favorite snack.
+#
+# Note: You do not HAVE to install/run opencode to use ask.
+#       But you do have to register an opencode.ai/zen account and get an API key.
+#       Once you get your API key, create a file auth.json and put it wherever you want on your system.
+#       I recommend the conventional location: ~/.local/share/opencode/auth.json
+#
+#       the file needs to contain the following:
+#
+#       {
+#          "opencode": {
+#           "type": "api",
+#           "key": "YOUR API key GOES HERE"
+#         }
+#       }
+#
+#       If you put the file somewhere other than the conventional location,
+#       then you will need to change the AUTH_FILE= line below to match where you put the file.
+AUTH_FILE="$HOME/.local/share/opencode/auth.json"
+# ########################################
+# ########################################
+
+# Where user defaults (model, cost threshold, pricing cache, skills) are stored.
+CONFIG_DIR="$HOME/.config/ask" # just use this as your config directory.  Don't be a PITA! ;)
+CONFIG_FILE="$CONFIG_DIR/ask.conf"
+SKILLS_FILE="$CONFIG_DIR/SKILLS.md"
+DEFAULT_MODEL="big-pickle" # <-- that is a FREE model provided by opencode Zen. It actually is decent for most simple questions!
+
+# Default system skill prepended to every prompt unless overridden by SKILLS.md.
+DEFAULT_SYSTEM_SKILL="You: expert in computers. All answers to be cited. Cites dated from when cite was obtained in your training data. Responses should be markdown with diagrams if helpful, unless response less than 10 lines. Answer quick, short, and to the point. Do not ask for clarifications. If you make assumptions, include those assumptions in response."
+
+# ########################################
+# ########################################
+
+# Print the help(usage) message to the terminal.
+print_usage() {
+  echo "Usage: ask [options] [prompt]"
+  echo ""
+  echo "Send a prompt to OpenCode Zen and print the response."
+  echo ""
+  echo "Options:"
+  echo "  -m                   List available models with pricing and select one"
+  echo "  -m <model>           Set model directly"
+  echo "  -c                   Set cost warning threshold (interactive)"
+  echo "  -c <amount>          Set cost warning threshold directly (e.g. 2.50)"
+  echo "  -s                   Edit the system skill (SKILLS.md) in \$EDITOR"
+  echo "  -t                   Force plain terminal output (do not use bat)"
+  echo "  -h, --h, --help      Show this help message"
+  echo ""
+  echo "A system skill is automatically prepended to every prompt from"
+  echo "$SKILLS_FILE, or from the built-in default if that file does not exist."
+  echo ""
+  echo "Without arguments, prompts interactively."
+  echo "With arguments, sends them as the prompt."
+  echo ""
+  echo "Attach a file by ending the prompt with: < path/to/file"
+  echo "  ask summarize this file '<' /path/to/file.txt"
+  echo "  ask 'summarize this file < /path/to/file.txt'"
+  echo "  ask                             # then type: summarize this file < /path/to/file.txt"
+  echo "  (The '<' must be quoted/escaped on the command line because it is a redirection operator.)"
+  echo ""
+  echo "Config: ~/.config/ask/ask.conf"
+  echo "Model defaults to: big-pickle"
+  echo "Cost threshold defaults to: 2.00"
+}
+
+# Return the system skill to prepend to every prompt. Uses SKILLS.md when it
+# exists, otherwise falls back to the built-in DEFAULT_SYSTEM_SKILL.
+get_system_skill() {
+  if [ -f "$SKILLS_FILE" ]; then
+    cat "$SKILLS_FILE" 2>/dev/null || echo "$DEFAULT_SYSTEM_SKILL"
+  else
+    echo "$DEFAULT_SYSTEM_SKILL"
+  fi
+}
+
+# Open the user's SKILLS.md in $EDITOR. Creates the file with the default
+# system skill if it does not already exist.
+edit_skills() {
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$SKILLS_FILE" ]; then
+    echo "$DEFAULT_SYSTEM_SKILL" >"$SKILLS_FILE"
+  fi
+  if [ -z "$EDITOR" ]; then
+    echo "Error: EDITOR environment variable is not set." >&2
+    exit 1
+  fi
+  "$EDITOR" "$SKILLS_FILE"
+  exit 0
+}
+
+# Handle help and skills editing before the authentication check. These are
+# local-only operations, so they don't need to bribe the API gatekeeper.
+if [ "$1" = "-h" ] || [ "$1" = "--h" ] || [ "$1" = "--help" ]; then
+  print_usage
+  exit 0
+fi
+
+if [ "$1" = "-s" ]; then
+  edit_skills
+  exit 0
+fi
+# ########################################
+# ########################################
+
+# ########################################
+# ########################################
+# Extract and validate the Zen API key before any network operation. No key, no query.
+# This is just the file with path, not the actual file content or the actual key, so no need to protect it.
+if [ ! -f "$AUTH_FILE" ]; then
+  echo "Error: OpenCode authentication file not found at $AUTH_FILE"
+  echo "Please run 'opencode auth login --provider zen' first. Or follow instructions in ask for use without opencode installed."
+  exit 1
+fi
+
+# Try several common JSON paths for the Zen API key. The `//` operator in jq
+# means "use the first one that is not null or empty". `.zen // empty` at the end
+# catches the case where the key is stored as a plain string.
+#
+# if we successfully get the key, we will protect it by clearing it from memory
+# as soon as we are done with it throughout the script.
+#
+API_KEY=$(jq -r '.opencode.key // .providers.zen.apiKey // .zen.apiKey // .zen // empty' "$AUTH_FILE")
+
+# First fallback: some older auth files store the key directly under `.zen`.
+# If the first extraction failed, try that specific field.
+if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
+  API_KEY=$(jq -r '.zen // empty' "$AUTH_FILE")
+fi
+
+if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
+  echo "Error: Could not find an active Zen API key inside $AUTH_FILE"
+  echo "Please ensure you have authenticated your local instance with opencode. Or follow instructions in ask for use without opencode installed."
+  exit 1
+fi
+# ########################################
+# ########################################
+
+# ########################################
+# ########################################
+# --- Interactive model selection ---
+
+# Lists available Zen models with pricing, lets the user pick one, and writes
+# the choice back to the config file. Also refreshes pricing once per day.
+select_model_interactive() {
+  require_internet
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "No config file found at $CONFIG_FILE"
+    echo ""
+    echo "To change models, first create the config directory and file:"
+    echo ""
+    echo "  mkdir -p $CONFIG_DIR"
+    echo "  echo 'MODEL=model-name' > $CONFIG_FILE"
+    echo ""
+    echo "Or set a model directly with:"
+    echo "  ask -m <model-name>"
+    return 1
+  fi
+
+  local TODAY
+  # date +%Y-%m-%d produces today's date as a string like "2026-07-01".
+  TODAY=$(date +%Y-%m-%d)
+
+  # Only fetch pricing once per day. MODEL_PRICING_DATE is stored in the config.
+  if [ "$MODEL_PRICING_DATE" != "$TODAY" ]; then
+    echo "Fetching latest pricing from opencode.ai/docs/zen..."
+    # curl -s runs silently (no progress bar). The `|| HTML=""` part ensures the
+    # script continues even if the network request fails.
+    HTML=$(curl -s "https://opencode.ai/docs/zen/" 2>/dev/null) || HTML=""
+    if [ -n "$HTML" ]; then
+      # The pricing page contains two HTML tables. The first maps display names
+      # to API model IDs. The second maps display names to input/output prices.
+      # This awk script parses both tables and merges them by display name.
+      PRICING_ENTRIES=$(echo "$HTML" | grep -o 'table>.*' | awk '
+BEGIN { t=0 }
+{ t++; if (t>2) exit; gsub(/.*<tbody>/,""); gsub(/<\/tbody>.*/,""); body=$0 }
+t==1 {
+  n=split(body, rows, /<\/tr>[ \t]*<tr>/)
+  for (i=1; i<=n; i++) {
+    row=rows[i]; gsub(/<tr>[ \t]*|[ \t]*<\/tr>/,"",row)
+    if (row=="" || row==" ") continue
+    split(row, cols, /<\/td>[ \t]*<td>/)
+    gsub(/<td>[ \t]*|[ \t]*<\/td>/,"",cols[1])
+    gsub(/<td>[ \t]*|[ \t]*<\/td>/,"",cols[2])
+    gsub(/<\/?code[^>]*>/,"",cols[1])
+    gsub(/<\/?code[^>]*>/,"",cols[2])
+    gsub(/^[ \t]+|[ \t]+$/,"",cols[1])
+    gsub(/^[ \t]+|[ \t]+$/,"",cols[2])
+    if (cols[1]!="" && cols[1]!="Model") ids[cols[1]]=cols[2]
+  }
+}
+t==2 {
+  n=split(body, rows, /<\/tr>[ \t]*<tr>/)
+  for (i=1; i<=n; i++) {
+    row=rows[i]; gsub(/<tr>[ \t]*|[ \t]*<\/tr>/,"",row)
+    if (row=="" || row==" ") continue
+    split(row, cols, /<\/td>[ \t]*<td>/)
+    gsub(/<td>[ \t]*|[ \t]*<\/td>/,"",cols[1])
+    gsub(/<td>[ \t]*|[ \t]*<\/td>/,"",cols[2])
+    gsub(/<td>[ \t]*|[ \t]*<\/td>/,"",cols[3])
+    gsub(/^[ \t]+|[ \t]+$/,"",cols[1])
+    gsub(/^[ \t]+|[ \t]+$/,"",cols[2])
+    gsub(/^[ \t]+|[ \t]+$/,"",cols[3])
+    gsub(/\$/,"",cols[2]); gsub(/\$/,"",cols[3])
+    if (cols[1]!="" && cols[1]!="Model") {
+      nm=cols[1]; gsub(/ *\([^)]*\) */,"",nm); gsub(/^[ \t]+|[ \t]+$/,"",nm)
+      if (!(nm in prices)) prices[nm]=cols[2]" "cols[3]
+    }
+  }
+}
+END { for (n in ids) printf "  [%s]=\"%s\"\n", ids[n], (n in prices)?prices[n]:"-- --" }
+' 2>/dev/null | sort)
+
+      if [ -n "$PRICING_ENTRIES" ]; then
+        # The `{ ... } > file` syntax groups several echo commands and writes
+        # them all to the config file at once.
+        {
+          echo "MODEL=$MODEL"
+          echo "COST_THRESHOLD=$COST_THRESHOLD"
+          echo "MODEL_PRICING_DATE=$TODAY"
+          echo "declare -A PRICING=("
+          echo "$PRICING_ENTRIES"
+          echo ")"
+        } >"$CONFIG_FILE"
+        # source reads the config file back into the current shell so the new
+        # PRICING array is available immediately.
+        source "$CONFIG_FILE"
+      else
+        echo "Warning: Could not parse pricing data. Using cached values."
+      fi
+    else
+      echo "Warning: Could not fetch pricing page. Using cached values."
+    fi
+  fi
+
+  echo "Fetching available models..."
+  MODELS_JSON=$(curl -s "https://opencode.ai/zen/v1/models" \
+    -H "Authorization: Bearer $API_KEY")
+
+  # jq -r '.data[] | .id' extracts the model ID from each item in the data array.
+  MODELS=$(echo "$MODELS_JSON" | jq -r '.data[] | .id' | sort)
+
+  if [ -z "$MODELS" ]; then
+    echo "Error: Could not fetch model list."
+    return 1
+  fi
+
+  echo ""
+  # IFS (Internal Field Separator) is set to a newline so `read` splits the
+  # model list only on line breaks. -a creates an indexed array (MODEL_ARRAY).
+  # The `<<<"$MODELS"` part is a here-string, feeding the variable as stdin.
+  # `|| true` prevents the command from failing on the last line.
+  IFS=$'\n' read -r -d '' -a MODEL_ARRAY <<<"$MODELS" || true
+
+  printf "  %-3s %-35s %s\n" "#" "Model" "Cost(Input/Output per 1M)"
+  printf "  %-3s %-35s %s\n" "---" "-----------------------------------" "---------------------------"
+  for i in "${!MODEL_ARRAY[@]}"; do
+    mid="${MODEL_ARRAY[$i]}"
+    raw="${PRICING[$mid]}"
+    if [ -z "$raw" ]; then
+      disp="--/--"
+    else
+      # Parameter expansion: everything before the first space is input cost.
+      inp="${raw%% *}"
+      # Everything after the first space is output cost.
+      outp="${raw#* }"
+      # Add dollar signs unless the price is "Free".
+      [ "$inp" != "Free" ] && inp="\$$inp"
+      [ "$outp" != "Free" ] && outp="\$$outp"
+      disp="$inp/$outp"
+    fi
+    printf "  %-3d %-35s %s\n" "$((i + 1))" "$mid" "$disp"
+  done
+  echo ""
+  echo -n "Select a model (1-${#MODEL_ARRAY[@]}): "
+  read -r SELECTION
+
+  # =~ is a bash regex match. ^[0-9]+$ means "only digits".
+  if ! [[ "$SELECTION" =~ ^[0-9]+$ ]] || [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "${#MODEL_ARRAY[@]}" ]; then
+    echo "Invalid selection."
+    return 1
+  fi
+
+  MODEL="${MODEL_ARRAY[$((SELECTION - 1))]}"
+  mkdir -p "$CONFIG_DIR"
+  {
+    echo "MODEL=$MODEL"
+    echo "COST_THRESHOLD=$COST_THRESHOLD"
+    echo "MODEL_PRICING_DATE=$TODAY"
+    echo "declare -A PRICING=("
+    for key in "${!PRICING[@]}"; do
+      echo "  [$key]=\"${PRICING[$key]}\""
+    done
+    echo ")"
+  } >"$CONFIG_FILE"
+  echo "Model set to: $MODEL"
+}
+
+# Source config at top level for defaults.
+# Initialize variables first so the sourced file can overwrite them.
+MODEL=""
+MODEL_PRICING_DATE=""
+COST_THRESHOLD="2.00"
+# `declare -A` creates an associative array (a hash map). PRICING maps model ID
+# to a "input_cost output_cost" string.
+declare -A PRICING=()
+if [ -f "$CONFIG_FILE" ]; then
+  source "$CONFIG_FILE"
+fi
+# Use the default model if the config did not set one.
+[ -z "$MODEL" ] && MODEL="$DEFAULT_MODEL"
+# Use the default threshold if the config did not set one.
+[ -z "$COST_THRESHOLD" ] && COST_THRESHOLD="2.00"
+# ########################################
+# ########################################
+
+# If the prompt ends with "< path/to/file", snag that file and append its
+# contents to the prompt. We only attach real files, so math questions like
+# "is 5 < 10" stay safely unchanged when no matching file lurks nearby.
+attach_file_to_prompt() {
+  local raw="$1"
+  local path=""
+
+  # Match a trailing " < path" where path is the final non-whitespace token.
+  if [[ "$raw" =~ \<[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+    path="${BASH_REMATCH[1]}"
+
+    if [ -f "$path" ] && [ -r "$path" ]; then
+      local prefix="${raw%< *}"
+      # Strip trailing whitespace from the prefix.
+      prefix="${prefix%"${prefix##*[![:space:]]}"}"
+      local content
+      content=$(cat "$path" 2>/dev/null) || {
+        echo "Warning: could not read file: $path" >&2
+        printf "%s" "$raw"
+        return 0
+      }
+
+      if [ -n "$prefix" ]; then
+        printf -- "%s\n\n--- File: %s ---\n\n%s" "$prefix" "$path" "$content"
+      else
+        printf -- "--- File: %s ---\n\n%s" "$path" "$content"
+      fi
+      return 0
+    fi
+  fi
+
+  printf "%s" "$raw"
+}
+
+# Make sure the machine is actually online before bothering the API. If not,
+# we bail with a friendly "No internet connection available." message.
+require_internet() {
+  if ! curl -s --max-time 5 -o /dev/null https://opencode.ai/ 2>/dev/null; then
+    echo "No internet connection available." >&2
+    exit 1
+  fi
+}
+
+# SPINNER_PID: the tiny background worker twirling the progress indicator.
+# SPINNER_START: when the twirling began (courtesy of $SECONDS, bash's built-in stopwatch).
+SPINNER_PID=""
+SPINNER_START=""
+
+start_spinner() {
+  local spin_chars='|/-\'
+  SPINNER_START=$SECONDS
+  (
+    local i=0
+    while true; do
+      local elapsed=$((SECONDS - SPINNER_START))
+      local mins=$((elapsed / 60))
+      local secs=$((elapsed % 60))
+      # Pick the next character from the spinner string. `% 4` wraps the index
+      # back to 0 after the last character.
+      local char="${spin_chars:$((i % 4)):1}"
+      # \r returns to the start of the line so each frame overwrites the last.
+      # >&2 sends the output to stderr so it does not mix with piped stdout.
+      printf "\r  %s %02d:%02d waiting for response..." "$char" "$mins" "$secs" >&2
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  # `$!` is the process ID of the background job we just started.
+  SPINNER_PID=$!
+  # Set a trap: if the user presses Ctrl+C, stop the spinner and exit.
+  trap 'stop_spinner false; exit 130' INT
+}
+
+stop_spinner() {
+  # ${1:-true} means "use the first argument, or default to true".
+  local show_time="${1:-true}"
+  if [ -n "$SPINNER_PID" ] && kill -0 "$SPINNER_PID" 2>/dev/null; then
+    kill "$SPINNER_PID" 2>/dev/null
+    # wait ensures the background process is fully gone before continuing.
+    wait "$SPINNER_PID" 2>/dev/null
+  fi
+  if [ "$show_time" = true ] && [ -n "$SPINNER_START" ]; then
+    local elapsed=$((SECONDS - SPINNER_START))
+    local mins=$((elapsed / 60))
+    local secs=$((elapsed % 60))
+    # Clear the spinner line, then print the final elapsed time.
+    printf "\r%-80s\r" "" >&2
+    printf "  completed in %02d:%02d\n" "$mins" "$secs" >&2
+  else
+    printf "\r%-80s\r" "" >&2
+  fi
+  SPINNER_PID=""
+  SPINNER_START=""
+  # Remove the Ctrl+C trap now that the spinner is gone.
+  trap - INT
+}
+
+main() {
+  # API_KEY arrives as the first positional argument. We declare it local so it
+  # doesn't escape into the wild when the script is sourced.
+  local API_KEY="$1"
+  shift
+
+  # --- Global option: -t (plain terminal output) ---
+
+  # Default to using `bat` if available. The -t flag disables this.
+  USE_BAT=true
+  CLEAN_ARGS=()
+  # Build a new argument list with -t removed so it does not get mistaken for
+  # the prompt text or another flag.
+  for arg in "$@"; do
+    if [ "$arg" = "-t" ] || [ "$arg" = "--t" ]; then
+      USE_BAT=false
+    else
+      CLEAN_ARGS+=("$arg")
+    fi
+  done
+  # set -- replaces the current positional parameters with the cleaned list.
+  set -- "${CLEAN_ARGS[@]}"
+
+  # --- Help flag ---
+
+  if [ "$1" = "-h" ] || [ "$1" = "--h" ] || [ "$1" = "--help" ]; then
+    print_usage
+    API_KEY=
+    exit 0
+  fi
+
+  # --- Skills editor flag ---
+
+  if [ "$1" = "-s" ]; then
+    edit_skills
+    exit 0
+  fi
+
+  # --- Cost threshold flag ---
+
+  if [ "$1" = "-c" ]; then
+    if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+      COST_THRESHOLD="$2"
+    else
+      echo -n "Enter dollar cost threshold for warnings (format: 0.00): "
+      read -r COST_THRESHOLD
+    fi
+    # Validate that the threshold is a number (e.g. 2, 2.50).
+    if ! [[ "$COST_THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      echo "Invalid threshold. Use a number like 2.00."
+      exit 1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    {
+      echo "MODEL=$MODEL"
+      echo "COST_THRESHOLD=$COST_THRESHOLD"
+      echo "MODEL_PRICING_DATE=$MODEL_PRICING_DATE"
+      echo "declare -A PRICING=("
+      for key in "${!PRICING[@]}"; do
+        echo "  [$key]=\"${PRICING[$key]}\""
+      done
+      echo ")"
+    } >"$CONFIG_FILE"
+    echo "Cost threshold set to \$$COST_THRESHOLD per 1M input tokens."
+    exit 0
+  fi
+
+  # --- Model selection / configuration ---
+
+  if [ "$1" = "-m" ]; then
+    if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+      MODEL="$2"
+      mkdir -p "$CONFIG_DIR"
+      {
+        echo "MODEL=$MODEL"
+        echo "COST_THRESHOLD=$COST_THRESHOLD"
+        # Reset the pricing date so the next -m run refreshes pricing.
+        echo "MODEL_PRICING_DATE="
+        echo "declare -A PRICING=("
+        for key in "${!PRICING[@]}"; do
+          echo "  [$key]=\"${PRICING[$key]}\""
+        done
+        echo ")"
+      } >"$CONFIG_FILE"
+      echo "Model set to: $MODEL"
+      # Remove the -m and model-name arguments so we can check for a prompt.
+      shift 2
+      if [ -z "$*" ]; then
+        exit 0
+      fi
+    else
+      select_model_interactive
+      exit 0
+    fi
+  fi
+
+  # --- Prompt input ---
+
+  if [ -z "$1" ]; then
+    # No prompt provided on the command line, so we politely ask the user.
+    tput setaf 6
+    echo -n "Ask OpenCode Zen(Model: $MODEL): "
+    tput setaf 11
+    read -r USER_PROMPT
+    tput sgr0
+    USER_PROMPT=$(attach_file_to_prompt "$USER_PROMPT")
+    if [ -z "$USER_PROMPT" ]; then
+      tput setaf 1
+      echo "Error: Prompt cannot be empty. Exiting."
+      tput sgr0
+      API_KEY=
+      exit 1
+    fi
+  else
+    # Join all remaining arguments into one prompt string.
+    USER_PROMPT="$*"
+    USER_PROMPT=$(attach_file_to_prompt "$USER_PROMPT")
+  fi
+
+  # Tack the system skill onto the front of the prompt. Custom SKILLS.md wins
+  # over the built-in default — everyone can customize how they want all their prompts handled by chosen LLM.
+  SYSTEM_SKILL=$(get_system_skill)
+  if [ -n "$SYSTEM_SKILL" ]; then
+    USER_PROMPT="$SYSTEM_SKILL
+
+---
+
+$USER_PROMPT"
+  fi
+
+  # --- Cost warning ---
+  #
+  # This is here in case you chnaged your model to a really expensive one maybe because you wanted super accurate info or code or whatever.
+  # But you forgot to change it back to a cheapo model.
+  # You don't want to spend a shit ton of $ on asking a simple question to an expensive model.
+  # So, this warns you.
+  #
+  raw_price="${PRICING[$MODEL]}"
+  if [ -n "$raw_price" ]; then
+    # Extract the input cost (first word) from the "input output" string.
+    inp_cost="${raw_price%% *}"
+    if [ "$inp_cost" != "Free" ] && [ "$inp_cost" != "--" ] && [ "$inp_cost" != "" ]; then
+      # awk is used here instead of bc because bc is not always installed.
+      # The awk program exits with status 1 if the cost is NOT >= threshold.
+      # The `!` inverts the result so the overall command succeeds when the
+      # cost meets or exceeds the threshold.
+      if awk "BEGIN{exit !($inp_cost >= $COST_THRESHOLD)}" 2>/dev/null; then
+        outp_cost="${raw_price#* }"
+        tput setaf 11
+        echo ""
+        echo "--- Cost Warning ---"
+        echo "Model: $MODEL"
+        echo "Cost : \$$inp_cost input / \$$outp_cost output per 1M tokens"
+        echo "Threshold: \$$COST_THRESHOLD per 1M input tokens"
+        echo -n "Press Enter to continue, m to select a different model, or anything else to exit: "
+        tput sgr0
+        read -r SWITCH_MODEL
+        if [ "$SWITCH_MODEL" = "m" ]; then
+          echo ""
+          select_model_interactive || exit 1
+        elif [ -n "$SWITCH_MODEL" ]; then
+          echo "Exiting."
+          exit 0
+        fi
+      fi
+    fi
+  fi
+
+  # One last connectivity sanity check before we fire the prompt into the cloud.
+  require_internet
+
+  # Determine which API family this model belongs to.
+  # Different model families require different endpoints and request formats.
+  API_FAMILY="openai-compatible"
+  case "$MODEL" in
+  gemini-*) API_FAMILY="gemini" ;;
+  esac
+
+  if [ "$API_FAMILY" = "gemini" ]; then
+    tput setaf 6
+    echo "Sending query to OpenCode Zen using model: $MODEL (Gemini native)..."
+    tput sgr0
+
+    # Build the JSON request body with jq. Using jq avoids quoting problems
+    # when the prompt contains special characters.
+    REQUEST_BODY=$(jq -n --arg prompt "$USER_PROMPT" '{
+      contents: [{role: "user", parts: [{text: $prompt}]}]
+    }')
+
+    # Show the spinner while curl is waiting for a response.
+    start_spinner
+    RESPONSE=$(curl -s "https://opencode.ai/zen/v1/models/$MODEL:generateContent" \
+      -H "Content-Type: application/json" \
+      -H "x-goog-api-key: $API_KEY" \
+      -d "$REQUEST_BODY")
+    stop_spinner
+
+    API_KEY=
+
+    # Parse the Gemini-native response format.
+    PARSED_TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+  else
+    tput setaf 6
+    echo "Sending query to OpenCode Zen using model: $MODEL..."
+    tput sgr0
+
+    # Build the standard OpenAI-compatible chat request body.
+    REQUEST_BODY=$(jq -n --arg model "$MODEL" --arg prompt "$USER_PROMPT" '{
+      model: $model,
+      messages: [{role: "user", content: $prompt}],
+      stream: false
+    }')
+
+    start_spinner
+    RESPONSE=$(curl -s "https://opencode.ai/zen/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d "$REQUEST_BODY")
+    stop_spinner
+
+    API_KEY=
+
+    # Parse the OpenAI-compatible response format.
+    PARSED_TEXT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+  fi
+
+  if [ -n "$PARSED_TEXT" ]; then
+    tput setaf 6
+    echo -e "\n--- Response ---\n"
+    tput sgr0
+
+    if [ "$USE_BAT" = true ] && command -v bat &>/dev/null; then
+      # Only nag the user with "Sent to bat..." if the response is tall enough
+      # to actually summon bat's pager. tput lines reports the terminal height; default to 24.
+      TERM_LINES=$(tput lines 2>/dev/null || echo 24)
+      RESPONSE_LINES=$(echo "$PARSED_TEXT" | wc -l)
+      if [ "$RESPONSE_LINES" -ge "$TERM_LINES" ]; then
+        tput setaf 11
+        echo "Sent to bat..."
+        tput sgr0
+      fi
+      echo "$PARSED_TEXT" | bat --language=markdown --style=plain
+    else
+      tput setaf 14
+      echo "$PARSED_TEXT"
+    fi
+    tput setaf 6
+    echo -e "\n----------------\n"
+    tput sgr0
+  else
+    # No content was parsed. Distinguish provider errors from other failures.
+    tput setaf 1
+    ERR_MSG=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+    ERR_CODE=$(echo "$RESPONSE" | jq -r '.error.code // empty')
+    ERR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // empty')
+    if [ -n "$ERR_MSG" ]; then
+      echo "API Error: $ERR_MSG"
+      [ -n "$ERR_CODE" ] && echo "Code: $ERR_CODE"
+      [ -n "$ERR_TYPE" ] && echo "Type: $ERR_TYPE"
+    else
+      echo "Processing Error: Could not extract text from the response payload."
+      echo "Raw diagnostic response:"
+      echo "$RESPONSE" | cut -c 1-240
+    fi
+    tput sgr0
+  fi
+
+  # Wipe the API key from memory before we go. Loose keys sink scripts.
+  API_KEY=
+}
+
+# Pass the API key extracted at the top level into main, then the rest of the
+# script's arguments. The global API_KEY is cleared after main returns.
+main "$API_KEY" "$@"
+API_KEY=
