@@ -31,7 +31,10 @@ So, you know how it goes... Got it doing what I wanted and then the "It could al
 
 ## Requirements
 
+> Note: Because **Opencode Zen API** does provide a free no auth required "big-pickle" model through their API (however, it is not guaranteed to work at any level and could become unavailable at any time in the future), I included the ability for `ask` to work with no `auth.json` file. Use it for evaluating but you really need to get an Opencode Zen API key to fully utilize ask. On that note, I believe the Zen is technically $20 (2 cups of foofoo coffee) and that $20 is your "balance" to use on the various models they offer. It is "pay as you go", so if you use up that $20 you initially signed up with, you can add more $ to your balance or be limited to the free models only.
+
 - A valid **Opencode Zen API key** in `~/.local/share/opencode/auth.json` (or wherever you told `ask` to look). You don't have to install the `opencode` CLI; you can create the JSON file yourself if you're feeling rebellious.
+- **OR** no API key at all, in which case `ask` will try the free `big-pickle` no-authentication endpoint. If it works, you're off to the races with only that model.
 - `jq`, `curl`, and `tput` (usually already hanging out on most Linux distributions)
 - `bat` (optional — makes Markdown responses look pretty)
 - A working internet connection, because `ask` refuses to shout into the void.
@@ -89,6 +92,8 @@ ask -c 2.50
 ```
 
 When a model exceeds the threshold, `ask` pauses to ask if you really meant to spend that much. Press `Enter` to continue, `m` to switch models, or anything else to exit and keep your wallet happy.
+
+> **Note:** If you are running without an API key, the only model available is `big-pickle`. Running `ask -m` will remind you of this limitation.
 
 ### Attach a file
 

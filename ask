@@ -26,9 +26,11 @@
 #       If you put the file somewhere other than the conventional location,
 #       then you will need to change the AUTH_FILE= line below to match where you put the file.
 AUTH_FILE="$HOME/.local/share/opencode/auth.json"
-# ########################################
-# ########################################
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+# ########################################
+# ########################################
 # Where user defaults (model, cost threshold, pricing cache, skills) are stored.
 CONFIG_DIR="$HOME/.config/ask" # just use this as your config directory.  Don't be a PITA! ;)
 CONFIG_FILE="$CONFIG_DIR/ask.conf"
@@ -38,8 +40,10 @@ DEFAULT_MODEL="big-pickle" # <-- that is a FREE model provided by opencode Zen. 
 # Default system skill prepended to every prompt unless overridden by SKILLS.md.
 DEFAULT_SYSTEM_SKILL="You: expert in computers. All answers to be cited. Cites dated from when cite was obtained in your training data. Responses should be markdown with diagrams if helpful, unless response less than 10 lines. Answer quick, short, and to the point. Do not ask for clarifications. If you make assumptions, include those assumptions in response."
 
-# ########################################
-# ########################################
+# When true, the API accepts requests without an API key for the big-pickle model.
+USE_NO_AUTH=false
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 # Print the help(usage) message to the terminal.
 print_usage() {
@@ -98,6 +102,8 @@ edit_skills() {
   exit 0
 }
 
+# ########################################
+# ########################################
 # Handle help and skills editing before the authentication check. These are
 # local-only operations, so they don't need to bribe the API gatekeeper.
 if [ "$1" = "-h" ] || [ "$1" = "--h" ] || [ "$1" = "--help" ]; then
@@ -109,41 +115,125 @@ if [ "$1" = "-s" ]; then
   edit_skills
   exit 0
 fi
+
+# If the user wants to change models but has no auth file, there is no point in
+# probing the API. Only the free big-pickle model is available without a key.
+if [ ! -f "$AUTH_FILE" ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "-m" ]; then
+      echo "Since you do not have an Zen API key, you can only use the big-pickle model." >&2
+      exit 1
+    fi
+  done
+fi
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 # ########################################
 # ########################################
+# SPINNER_PID: the tiny background worker twirling the progress indicator.
+# SPINNER_START: when the twirling began (courtesy of $SECONDS, bash's built-in stopwatch).
+SPINNER_PID=""
+SPINNER_START=""
+
+start_spinner() {
+  local spin_chars='|/-\'
+  SPINNER_START=$SECONDS
+  (
+    local i=0
+    while true; do
+      local elapsed=$((SECONDS - SPINNER_START))
+      local mins=$((elapsed / 60))
+      local secs=$((elapsed % 60))
+      # Pick the next character from the spinner string. `% 4` wraps the index
+      # back to 0 after the last character.
+      local char="${spin_chars:$((i % 4)):1}"
+      # \r returns to the start of the line so each frame overwrites the last.
+      # >&2 sends the output to stderr so it does not mix with piped stdout.
+      printf "\r  %s %02d:%02d waiting for response..." "$char" "$mins" "$secs" >&2
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  # `$!` is the process ID of the background job we just started.
+  SPINNER_PID=$!
+  # Set a trap: if the user presses Ctrl+C, stop the spinner and exit.
+  trap 'stop_spinner false; exit 130' INT
+}
+
+stop_spinner() {
+  # ${1:-true} means "use the first argument, or default to true".
+  local show_time="${1:-true}"
+  if [ -n "$SPINNER_PID" ] && kill -0 "$SPINNER_PID" 2>/dev/null; then
+    kill "$SPINNER_PID" 2>/dev/null
+    # wait ensures the background process is fully gone before continuing.
+    wait "$SPINNER_PID" 2>/dev/null
+  fi
+  if [ "$show_time" = true ] && [ -n "$SPINNER_START" ]; then
+    local elapsed=$((SECONDS - SPINNER_START))
+    local mins=$((elapsed / 60))
+    local secs=$((elapsed % 60))
+    # Clear the spinner line, then print the final elapsed time.
+    printf "\r%-80s\r" "" >&2
+    printf "  completed in %02d:%02d\n" "$mins" "$secs" >&2
+  else
+    printf "\r%-80s\r" "" >&2
+  fi
+  SPINNER_PID=""
+  SPINNER_START=""
+  # Remove the Ctrl+C trap now that the spinner is gone.
+  trap - INT
+}
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 # ########################################
 # ########################################
 # Extract and validate the Zen API key before any network operation. No key, no query.
 # This is just the file with path, not the actual file content or the actual key, so no need to protect it.
 if [ ! -f "$AUTH_FILE" ]; then
-  echo "Error: OpenCode authentication file not found at $AUTH_FILE"
-  echo "Please run 'opencode auth login --provider zen' first. Or follow instructions in ask for use without opencode installed."
-  exit 1
-fi
+  # Some Zen endpoints accept requests without an API key for the free big-pickle
+  # model. Probe the API with a tiny payload before giving up.
+  tput setaf 6
+  echo "Checking availability of free big-pickle api..."
+  tput sgr0
+  start_spinner
+  NO_AUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    "https://opencode.ai/zen/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model": "big-pickle", "messages": [{"role": "user", "content": "hello"}]}' 2>/dev/null)
+  stop_spinner
+  if [ "$NO_AUTH_STATUS" = "200" ]; then
+    USE_NO_AUTH=true
+  else
+    echo "Error: OpenCode authentication file not found at $AUTH_FILE"
+    echo "Please run 'opencode auth login --provider zen' first. Or follow instructions in ask for use without opencode installed."
+    exit 1
+  fi
+else
+  # Try several common JSON paths for the Zen API key. The `//` operator in jq
+  # means "use the first one that is not null or empty". `.zen // empty` at the end
+  # catches the case where the key is stored as a plain string.
+  #
+  # if we successfully get the key, we will protect it by clearing it from memory
+  # as soon as we are done with it throughout the script.
+  #
+  API_KEY=$(jq -r '.opencode.key // .providers.zen.apiKey // .zen.apiKey // .zen // empty' "$AUTH_FILE")
 
-# Try several common JSON paths for the Zen API key. The `//` operator in jq
-# means "use the first one that is not null or empty". `.zen // empty` at the end
-# catches the case where the key is stored as a plain string.
-#
-# if we successfully get the key, we will protect it by clearing it from memory
-# as soon as we are done with it throughout the script.
-#
-API_KEY=$(jq -r '.opencode.key // .providers.zen.apiKey // .zen.apiKey // .zen // empty' "$AUTH_FILE")
+  # First fallback: some older auth files store the key directly under `.zen`.
+  # If the first extraction failed, try that specific field.
+  if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
+    API_KEY=$(jq -r '.zen // empty' "$AUTH_FILE")
+  fi
 
-# First fallback: some older auth files store the key directly under `.zen`.
-# If the first extraction failed, try that specific field.
-if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
-  API_KEY=$(jq -r '.zen // empty' "$AUTH_FILE")
+  if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
+    echo "Error: Could not find an active Zen API key inside $AUTH_FILE"
+    echo "Please ensure you have authenticated your local instance with opencode. Or follow instructions in ask for use without opencode installed."
+    exit 1
+  fi
 fi
-
-if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
-  echo "Error: Could not find an active Zen API key inside $AUTH_FILE"
-  echo "Please ensure you have authenticated your local instance with opencode. Or follow instructions in ask for use without opencode installed."
-  exit 1
-fi
-# ########################################
-# ########################################
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 # ########################################
 # ########################################
@@ -152,6 +242,10 @@ fi
 # Lists available Zen models with pricing, lets the user pick one, and writes
 # the choice back to the config file. Also refreshes pricing once per day.
 select_model_interactive() {
+  if [ "$USE_NO_AUTH" = true ]; then
+    echo "Since you do not have an Zen API key, you can only use the big-pickle model." >&2
+    return 1
+  fi
   require_internet
 
   if [ ! -f "$CONFIG_FILE" ]; then
@@ -321,8 +415,8 @@ fi
 [ -z "$MODEL" ] && MODEL="$DEFAULT_MODEL"
 # Use the default threshold if the config did not set one.
 [ -z "$COST_THRESHOLD" ] && COST_THRESHOLD="2.00"
-# ########################################
-# ########################################
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 # If the prompt ends with "< path/to/file", snag that file and append its
 # contents to the prompt. We only attach real files, so math questions like
@@ -365,60 +459,6 @@ require_internet() {
     echo "No internet connection available." >&2
     exit 1
   fi
-}
-
-# SPINNER_PID: the tiny background worker twirling the progress indicator.
-# SPINNER_START: when the twirling began (courtesy of $SECONDS, bash's built-in stopwatch).
-SPINNER_PID=""
-SPINNER_START=""
-
-start_spinner() {
-  local spin_chars='|/-\'
-  SPINNER_START=$SECONDS
-  (
-    local i=0
-    while true; do
-      local elapsed=$((SECONDS - SPINNER_START))
-      local mins=$((elapsed / 60))
-      local secs=$((elapsed % 60))
-      # Pick the next character from the spinner string. `% 4` wraps the index
-      # back to 0 after the last character.
-      local char="${spin_chars:$((i % 4)):1}"
-      # \r returns to the start of the line so each frame overwrites the last.
-      # >&2 sends the output to stderr so it does not mix with piped stdout.
-      printf "\r  %s %02d:%02d waiting for response..." "$char" "$mins" "$secs" >&2
-      i=$((i + 1))
-      sleep 0.1
-    done
-  ) &
-  # `$!` is the process ID of the background job we just started.
-  SPINNER_PID=$!
-  # Set a trap: if the user presses Ctrl+C, stop the spinner and exit.
-  trap 'stop_spinner false; exit 130' INT
-}
-
-stop_spinner() {
-  # ${1:-true} means "use the first argument, or default to true".
-  local show_time="${1:-true}"
-  if [ -n "$SPINNER_PID" ] && kill -0 "$SPINNER_PID" 2>/dev/null; then
-    kill "$SPINNER_PID" 2>/dev/null
-    # wait ensures the background process is fully gone before continuing.
-    wait "$SPINNER_PID" 2>/dev/null
-  fi
-  if [ "$show_time" = true ] && [ -n "$SPINNER_START" ]; then
-    local elapsed=$((SECONDS - SPINNER_START))
-    local mins=$((elapsed / 60))
-    local secs=$((elapsed % 60))
-    # Clear the spinner line, then print the final elapsed time.
-    printf "\r%-80s\r" "" >&2
-    printf "  completed in %02d:%02d\n" "$mins" "$secs" >&2
-  else
-    printf "\r%-80s\r" "" >&2
-  fi
-  SPINNER_PID=""
-  SPINNER_START=""
-  # Remove the Ctrl+C trap now that the spinner is gone.
-  trap - INT
 }
 
 main() {
@@ -491,6 +531,10 @@ main() {
   # --- Model selection / configuration ---
 
   if [ "$1" = "-m" ]; then
+    if [ "$USE_NO_AUTH" = true ]; then
+      echo "Since you do not have an Zen API key, you can only use the big-pickle model." >&2
+      exit 1
+    fi
     if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
       MODEL="$2"
       mkdir -p "$CONFIG_DIR"
@@ -515,6 +559,12 @@ main() {
       select_model_interactive
       exit 0
     fi
+  fi
+
+  # When running without an API key, the only model available is big-pickle.
+  # Make sure the user sees the correct model name in the prompt and messages.
+  if [ "$USE_NO_AUTH" = true ]; then
+    MODEL="big-pickle"
   fi
 
   # --- Prompt input ---
@@ -599,7 +649,29 @@ $USER_PROMPT"
   gemini-*) API_FAMILY="gemini" ;;
   esac
 
-  if [ "$API_FAMILY" = "gemini" ]; then
+  if [ "$USE_NO_AUTH" = true ]; then
+    # No API key available, so we pin the model to the free big-pickle endpoint.
+    MODEL="big-pickle"
+    tput setaf 6
+    echo "Sending query to OpenCode Zen using model: big-pickle (no authentication)..."
+    tput sgr0
+
+    REQUEST_BODY=$(jq -n --arg prompt "$USER_PROMPT" '{
+      model: "big-pickle",
+      messages: [{role: "user", content: $prompt}],
+      stream: false
+    }')
+
+    start_spinner
+    RESPONSE=$(curl -s "https://opencode.ai/zen/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -d "$REQUEST_BODY")
+    stop_spinner
+    API_KEY=
+
+    PARSED_TEXT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+  elif [ "$API_FAMILY" = "gemini" ]; then
+    # Gemini models require a differnt request body format and response format.
     tput setaf 6
     echo "Sending query to OpenCode Zen using model: $MODEL (Gemini native)..."
     tput sgr0
@@ -617,12 +689,12 @@ $USER_PROMPT"
       -H "x-goog-api-key: $API_KEY" \
       -d "$REQUEST_BODY")
     stop_spinner
-
     API_KEY=
 
     # Parse the Gemini-native response format.
     PARSED_TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
   else
+    # All of the other models require this request body format and response format.
     tput setaf 6
     echo "Sending query to OpenCode Zen using model: $MODEL..."
     tput sgr0
@@ -640,7 +712,6 @@ $USER_PROMPT"
       -H "Authorization: Bearer $API_KEY" \
       -d "$REQUEST_BODY")
     stop_spinner
-
     API_KEY=
 
     # Parse the OpenAI-compatible response format.
