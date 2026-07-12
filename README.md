@@ -6,6 +6,8 @@ A lightweight CLI tool that sends prompts to [Opencode Zen](https://opencode.ai/
 
 `ask` is a single-file bash script that does the heavy lifting so you don't have to leave your terminal:
 
+[My Blog Post✴️](https://csimw.com/post/ask-ai-terminal-tool)
+
 1. Reads your Zen API key from `~/.local/share/opencode/auth.json` (or wherever you stashed it).
 2. Picks the correct [Opencode Zen](https://opencode.ai/zen) endpoint for the selected model family:
    - `/v1/chat/completions` for OpenAI-compatible models (e.g. `big-pickle`, `qwen-*`, `deepseek-*`, `glm-*`, `minimax-*`)
@@ -215,7 +217,9 @@ No build system, no test suite, no ceremony — just a bash script and a dream.
 ## Potential Future Additions
 
 - Local LLM hook
+- A Windows PowerShell version
+- A version written in C
 
 ## License
 
-Unlicensed. This project is released without any license or warranty.
+Unlicensed. This project is released without any license or warranty. Would be cool to give me credit though ;)
