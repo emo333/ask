@@ -51,6 +51,20 @@ API_KEY=""
 # Runtime state for the progress spinner.
 SPINNER_PID=""
 SPINNER_START=""
+
+# Terminal color codes, resolved once if tput is available.
+C_CYAN=""
+C_YELLOW=""
+C_RED=""
+C_BRIGHT_CYAN=""
+C_RESET=""
+if command -v tput >/dev/null 2>&1; then
+  C_CYAN="$(tput setaf 6 2>/dev/null || true)"
+  C_YELLOW="$(tput setaf 11 2>/dev/null || true)"
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_BRIGHT_CYAN="$(tput setaf 14 2>/dev/null || true)"
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+fi
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -243,13 +257,7 @@ fi
 if [[ ! -f "$AUTH_FILE" ]]; then
   # Some Zen endpoints accept requests without an API key for the free big-pickle
   # model. Probe the API with a tiny payload before giving up.
-  if command -v tput >/dev/null 2>&1; then
-    tput setaf 6
-  fi
-  printf '%s\n' "Checking availability of free big-pickle api..."
-  if command -v tput >/dev/null 2>&1; then
-    tput sgr0
-  fi
+  printf '%s%s%s\n' "$C_CYAN" "Checking availability of free big-pickle api..." "$C_RESET"
   start_spinner
   NO_AUTH_STATUS="$(
     curl -sS -o /dev/null -w '%{http_code}' \
@@ -404,23 +412,17 @@ END { for (n in ids) printf "  [%s]=\"%s\"\n", ids[n], (n in prices)?prices[n]:"
 
       if [[ -n "$PRICING_ENTRIES" ]]; then
         MODEL_PRICING_DATE="$TODAY"
-        {
-          printf 'MODEL=%q\n' "$MODEL"
-          printf 'COST_THRESHOLD=%q\n' "$COST_THRESHOLD"
-          printf 'MODEL_PRICING_DATE=%q\n' "$TODAY"
-          # -gA: keep PRICING global even when this file is sourced from a function.
-          printf 'declare -gA PRICING=(\n'
-          # Rewrite awk rows ([id]="price") into safely quoted declare -gA entries.
-          while IFS= read -r pricing_line || [[ -n "$pricing_line" ]]; do
-            [[ -z "$pricing_line" ]] && continue
-            if [[ "$pricing_line" =~ ^[[:space:]]*\[([^\]]+)\]=\"(.*)\"[[:space:]]*$ ]]; then
-              printf '  [%q]=%q\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-            fi
-          done <<<"$PRICING_ENTRIES"
-          printf ')\n'
-        } >"$CONFIG_FILE"
-        # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
+        # Rebuild PRICING from fetched entries, then persist via write_config.
+        declare -gA PRICING=()
+        while IFS= read -r pricing_line || [[ -n "$pricing_line" ]]; do
+          if [[ -z "$pricing_line" ]]; then
+            continue
+          fi
+          if [[ "$pricing_line" =~ ^[[:space:]]*\[([^\]]+)\]=\"(.*)\"[[:space:]]*$ ]]; then
+            PRICING["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+          fi
+        done <<<"$PRICING_ENTRIES"
+        write_config "$TODAY"
       else
         printf '%s\n' "Warning: Could not parse pricing data. Using cached values."
       fi
@@ -637,26 +639,12 @@ main() {
   local USER_PROMPT=""
   if [[ -z "${1:-}" ]]; then
     # No prompt provided on the command line, so we politely ask the user.
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf 'Ask OpenCode Zen(Model: %s): ' "$MODEL"
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 11
-    fi
+    printf '%sAsk OpenCode Zen(Model: %s): %s' "$C_CYAN" "$MODEL" "$C_YELLOW"
     read -r USER_PROMPT
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '%s' "$C_RESET"
     USER_PROMPT="$(attach_file_to_prompt "$USER_PROMPT")"
     if [[ -z "$USER_PROMPT" ]]; then
-      if command -v tput >/dev/null 2>&1; then
-        tput setaf 1
-      fi
-      printf '%s\n' "Error: Prompt cannot be empty. Exiting."
-      if command -v tput >/dev/null 2>&1; then
-        tput sgr0
-      fi
+      printf '%s%s%s\n' "$C_RED" "Error: Prompt cannot be empty. Exiting." "$C_RESET"
       API_KEY=""
       exit 1
     fi
@@ -696,18 +684,12 @@ ${USER_PROMPT}"
       # cost meets or exceeds the threshold.
       if awk "BEGIN{exit !($inp_cost >= $COST_THRESHOLD)}" 2>/dev/null; then
         local outp_cost="${raw_price#* }"
-        if command -v tput >/dev/null 2>&1; then
-          tput setaf 11
-        fi
         printf '\n'
-        printf '%s\n' "--- Cost Warning ---"
+        printf '%s%s\n' "$C_YELLOW" "--- Cost Warning ---"
         printf 'Model: %s\n' "$MODEL"
         printf 'Cost : $%s input / $%s output per 1M tokens\n' "$inp_cost" "$outp_cost"
         printf 'Threshold: $%s per 1M input tokens\n' "$COST_THRESHOLD"
-        printf 'Press Enter to continue, m to select a different model, or anything else to exit: '
-        if command -v tput >/dev/null 2>&1; then
-          tput sgr0
-        fi
+        printf 'Press Enter to continue, m to select a different model, or anything else to exit: %s' "$C_RESET"
         local SWITCH_MODEL=""
         read -r SWITCH_MODEL
         if [[ "$SWITCH_MODEL" == "m" ]]; then
@@ -738,13 +720,7 @@ ${USER_PROMPT}"
   if [[ "$USE_NO_AUTH" == true ]]; then
     # No API key available, so we pin the model to the free big-pickle endpoint.
     MODEL="big-pickle"
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf '%s\n' "Sending query to OpenCode Zen using model: big-pickle (no authentication)..."
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '%s%s%s\n' "$C_CYAN" "Sending query to OpenCode Zen using model: big-pickle (no authentication)..." "$C_RESET"
 
     REQUEST_BODY="$(jq -n --arg prompt "$USER_PROMPT" '{
       model: "big-pickle",
@@ -762,13 +738,7 @@ ${USER_PROMPT}"
     PARSED_TEXT="$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty')" || PARSED_TEXT=""
   elif [[ "$API_FAMILY" == "gemini" ]]; then
     # Gemini models require a differnt request body format and response format.
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf '%s\n' "Sending query to OpenCode Zen using model: ${MODEL} (Gemini native)..."
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '%s%s%s\n' "$C_CYAN" "Sending query to OpenCode Zen using model: ${MODEL} (Gemini native)..." "$C_RESET"
 
     # Build the JSON request body with jq. Using jq avoids quoting problems
     # when the prompt contains special characters.
@@ -789,13 +759,7 @@ ${USER_PROMPT}"
     PARSED_TEXT="$(printf '%s' "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')" || PARSED_TEXT=""
   else
     # All of the other models require this request body format and response format.
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf '%s\n' "Sending query to OpenCode Zen using model: ${MODEL}..."
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '%s%s%s\n' "$C_CYAN" "Sending query to OpenCode Zen using model: ${MODEL}..." "$C_RESET"
 
     # Build the standard OpenAI-compatible chat request body.
     REQUEST_BODY="$(jq -n --arg model "$MODEL" --arg prompt "$USER_PROMPT" '{
@@ -817,13 +781,7 @@ ${USER_PROMPT}"
   fi
 
   if [[ -n "$PARSED_TEXT" ]]; then
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf '\n--- Response ---\n\n'
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '\n%s--- Response ---%s\n\n' "$C_CYAN" "$C_RESET"
 
     if [[ "$USE_BAT" == true ]] && command -v bat >/dev/null 2>&1; then
       # Only nag the user with "Sent to bat..." if the response is tall enough
@@ -832,55 +790,31 @@ ${USER_PROMPT}"
       TERM_LINES="$(tput lines 2>/dev/null || printf '24')"
       RESPONSE_LINES="$(printf '%s\n' "$PARSED_TEXT" | wc -l)"
       if ((RESPONSE_LINES >= TERM_LINES)); then
-        if command -v tput >/dev/null 2>&1; then
-          tput setaf 11
-        fi
-        printf '%s\n' "Sent to bat..."
-        if command -v tput >/dev/null 2>&1; then
-          tput sgr0
-        fi
+        printf '%s%s%s\n' "$C_YELLOW" "Sent to bat..." "$C_RESET"
       fi
       printf '%s\n' "$PARSED_TEXT" | bat --language=markdown --style=plain
     else
-      if command -v tput >/dev/null 2>&1; then
-        tput setaf 14
-      fi
-      printf '%s\n' "$PARSED_TEXT"
-      if command -v tput >/dev/null 2>&1; then
-        tput sgr0
-      fi
+      printf '%s%s%s\n' "$C_BRIGHT_CYAN" "$PARSED_TEXT" "$C_RESET"
     fi
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 6
-    fi
-    printf '\n----------------\n\n'
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
-    fi
+    printf '\n%s----------------%s\n\n' "$C_CYAN" "$C_RESET"
   else
     # No content was parsed. Distinguish provider errors from other failures.
-    if command -v tput >/dev/null 2>&1; then
-      tput setaf 1
-    fi
     local ERR_MSG ERR_CODE ERR_TYPE
     ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error.message // empty')" || ERR_MSG=""
     ERR_CODE="$(printf '%s' "$RESPONSE" | jq -r '.error.code // empty')" || ERR_CODE=""
     ERR_TYPE="$(printf '%s' "$RESPONSE" | jq -r '.error.type // empty')" || ERR_TYPE=""
     if [[ -n "$ERR_MSG" ]]; then
-      printf 'API Error: %s\n' "$ERR_MSG"
+      printf '%sAPI Error: %s%s\n' "$C_RED" "$ERR_MSG" "$C_RESET"
       if [[ -n "$ERR_CODE" ]]; then
-        printf 'Code: %s\n' "$ERR_CODE"
+        printf '%sCode: %s%s\n' "$C_RED" "$ERR_CODE" "$C_RESET"
       fi
       if [[ -n "$ERR_TYPE" ]]; then
-        printf 'Type: %s\n' "$ERR_TYPE"
+        printf '%sType: %s%s\n' "$C_RED" "$ERR_TYPE" "$C_RESET"
       fi
     else
-      printf '%s\n' "Processing Error: Could not extract text from the response payload."
-      printf '%s\n' "Raw diagnostic response:"
-      printf '%.240s\n' "$RESPONSE"
-    fi
-    if command -v tput >/dev/null 2>&1; then
-      tput sgr0
+      printf '%s%s%s\n' "$C_RED" "Processing Error: Could not extract text from the response payload." "$C_RESET"
+      printf '%s%s%s\n' "$C_RED" "Raw diagnostic response:" "$C_RESET"
+      printf '%s%.240s%s\n' "$C_RED" "$RESPONSE" "$C_RESET"
     fi
   fi
 
