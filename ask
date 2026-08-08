@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ask:
+#     -- Author: Mitch Wilson
+#     -- Created on: 2026-6-26
+#     -- Repo: https://github.com/emo333/ask
+#     -- License: MIT
+# ------------------------------------------
 # This script is a single-file bash CLI that sends a prompt to Opencode Zen's API
 # and prints the response in the terminal. It is meant to be run directly as either ./ask or,
 # if you place it somewhere else like ~/.local/bin/ and that has been added to your PATH, as ask.

@@ -219,7 +219,3 @@ No build system, no test suite, no ceremony — just a bash script and a dream.
 - Local LLM hook
 - A Windows PowerShell version
 - A version written in C
-
-## License
-
-Unlicensed. This project is released without any license or warranty. Would be cool to give me credit though ;)
